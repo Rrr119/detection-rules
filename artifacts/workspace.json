@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid38850",
+  "B": "/home/dev/feedback/uid38850",
+  "sha": "5966072382ff69c48160728f6daef5e2335a38d1",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "elastic",
+    "repo": "detection-rules",
+    "sha": "5966072382ff69c48160728f6daef5e2335a38d1"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "detection-rules",
+    "cloneUrl": "https://github.com/Rrr119/detection-rules.git"
+  },
+  "at": "2026-11-25T22:42:38.073Z"
+}

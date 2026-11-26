@@ -5,6 +5,8 @@
 
 """Shell for detection-rules."""
 
+import os
+import sys
 from pathlib import Path
 
 import click
@@ -24,7 +26,16 @@ BANNER = r"""
 
 def main() -> None:
     """CLI entry point."""
-    click.echo(BANNER)
+    json_requested = (
+        "--json" in sys.argv
+        or any(
+            arg == "json" and index > 0 and sys.argv[index - 1] in {"--format", "-f"}
+            for index, arg in enumerate(sys.argv)
+        )
+        or any(arg.startswith("--format=json") for arg in sys.argv)
+    )
+    if not json_requested and not os.getenv("DR_NO_BANNER"):
+        click.echo(BANNER)
     root(prog_name="detection_rules")
 
 

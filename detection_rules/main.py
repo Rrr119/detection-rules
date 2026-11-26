@@ -38,6 +38,18 @@ from .misc import (
     raise_client_error,
 )
 from .rule import DeprecatedRule, QueryRuleData, TOMLRule, TOMLRuleContents
+from .rule_analysis import (
+    analyze_rules as build_rule_analysis,
+)
+from .rule_analysis import (
+    build_coverage_report,
+    finding_rows,
+    flagged_rule_rows,
+    load_records,
+    render_coverage_markdown,
+    render_markdown,
+    report_to_json,
+)
 from .rule_formatter import toml_write
 from .rule_loader import RawRuleCollection, RuleCollection, update_metadata_from_file
 from .schemas import all_versions, definitions, get_incompatible_fields, get_schema_file
@@ -814,6 +826,298 @@ def search_rules(  # noqa: PLR0913, PLR0917
         click.echo_via_pager(table) if pager else click.echo(table)
 
     return filtered
+
+
+def _resolve_analysis_paths(
+    paths: tuple[Path, ...], rules_dir: tuple[Path, ...], with_baseline: bool = False
+) -> list[Path]:
+    """Resolve rule paths for analysis commands; default to configured rule dirs."""
+    resolved: list[Path] = [Path(d) for d in rules_dir]
+    resolved.extend(Path(p) for p in paths)
+    if not resolved:
+        resolved = [Path(p) for p in RULES_DIRS]
+    elif with_baseline:
+        resolved.extend(Path(p) for p in RULES_DIRS)
+    existing = [p for p in resolved if p.exists()]
+    if not existing:
+        raise click.UsageError(f"No valid rule paths found from: {', '.join(map(str, resolved))}")
+    return existing
+
+
+def _write_or_echo(content: str, output: Path | None) -> None:
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(content, encoding="utf-8")
+        click.secho(f"Report written to {output}", fg="green", err=True)
+    else:
+        click.echo(content)
+
+
+def _wants_json(output_format: str, as_json: bool, output: Path | None) -> bool:
+    """Resolve JSON output, inferring it from a ``.json`` output file."""
+    if as_json or output_format == "json":
+        return True
+    return output_format == "table" and output is not None and output.suffix.lower() == ".json"
+
+
+def _echo_table(rows: list[dict[str, Any]], columns: list[str]) -> None:
+    from eql.table import Table  # type: ignore[reportMissingTypeStubs]
+
+    if not rows:
+        click.secho("No rows.", fg="green")
+        return
+    table: Table = Table.from_list(columns, rows)  # type: ignore[reportUnknownMemberType]
+    click.echo(table)
+
+
+_ANALYSIS_PATH_ARG = click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
+_ANALYSIS_DIR_OPT = click.option(
+    "--rules-dir",
+    "-d",
+    multiple=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Directory containing rule files (repeatable). Defaults to configured rule_dirs.",
+)
+_FORMAT_OPT = click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json", "markdown"]),
+    default="table",
+    help="Output format.",
+)
+_JSON_OPT = click.option("--json", "as_json", is_flag=True, help="Shorthand for --format json.")
+_OUTPUT_OPT = click.option(
+    "--output", "-o", type=click.Path(dir_okay=False, path_type=Path), help="Write report to this file."
+)
+_STRICT_OPT = click.option(
+    "--strict", is_flag=True, help="Exit with status 1 when any duplicate/conflict finding is present."
+)
+_DEPRECATED_OPT = click.option(
+    "--include-deprecated",
+    is_flag=True,
+    help="Include rules under _deprecated/ directories (excluded by default).",
+)
+_BASELINE_OPT = click.option(
+    "--with-baseline",
+    is_flag=True,
+    help="Also compare explicit PATHS against the configured repository rule directories.",
+)
+
+
+def _analysis_options(func: Any) -> Any:
+    for option in (
+        _STRICT_OPT,
+        _DEPRECATED_OPT,
+        _BASELINE_OPT,
+        _OUTPUT_OPT,
+        _JSON_OPT,
+        _FORMAT_OPT,
+        _ANALYSIS_DIR_OPT,
+    ):
+        func = option(func)
+    return _ANALYSIS_PATH_ARG(func)
+
+
+@root.command("analyze-rules")
+@_analysis_options
+@click.option("--coverage/--no-coverage", default=True, help="Include coverage statistics.")
+@click.pass_context
+def analyze_rules_cmd(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    paths: tuple[Path, ...],
+    rules_dir: tuple[Path, ...],
+    output_format: str,
+    as_json: bool,
+    output: Path | None,
+    strict: bool,
+    coverage: bool,
+    include_deprecated: bool,
+    with_baseline: bool,
+) -> dict[str, Any] | None:
+    """Semantic dedup, conflict detection and coverage for rules.
+
+    规则语义去重、冲突检测与覆盖度报告。Scans the existing TOML/JSON rule
+    format (or injected rule files/directories passed as PATHS).
+
+    \b
+    Examples:
+        detection_rules analyze-rules --json -o report.json
+        detection_rules analyze-rules ./injected_rules --format markdown
+        detection_rules detect-duplicates rules/windows --strict
+        detection_rules coverage-report --json
+    """
+    target_paths = _resolve_analysis_paths(paths, rules_dir, with_baseline)
+    report = build_rule_analysis(target_paths, include_coverage=coverage, include_deprecated=include_deprecated)
+
+    if _wants_json(output_format, as_json, output):
+        _write_or_echo(report_to_json(report), output)
+    elif output_format == "markdown":
+        _write_or_echo(render_markdown(report), output)
+    else:
+        summary = report["summary"]
+        click.secho("Rule semantic analysis", fg="cyan", bold=True)
+        click.echo(
+            f"analyzed={summary['rules_analyzed']} detected={summary['detected_rule_count']} "
+            f"findings={summary['findings_total']} "
+            f"(duplicate={summary['duplicate_findings']} conflict={summary['conflict_findings']})"
+        )
+        click.echo(
+            "exclusive classification: "
+            f"duplicate={summary['classification_counts']['duplicate']} "
+            f"conflict={summary['classification_counts']['conflict']} "
+            f"unique={summary['classification_counts']['unique']}"
+        )
+        if summary.get("unparsed_files"):
+            click.secho(f"unparsed files: {len(summary['unparsed_files'])}", fg="yellow")
+
+        rows = finding_rows(report)
+        if rows:
+            click.secho("\nFindings (duplicates & conflicts):", fg="cyan", bold=True)
+            _echo_table(rows, ["id", "kind", "category", "confidence", "rules"])
+
+        flagged = flagged_rule_rows(report)
+        if flagged:
+            click.secho("\nPer-rule classification:", fg="cyan", bold=True)
+            _echo_table(flagged, ["index", "classification", "verdict", "rule_id", "name", "categories"])
+
+        cov = report.get("coverage")
+        if cov:
+            click.secho("\nCoverage snapshot:", fg="cyan", bold=True)
+            click.echo(
+                f"tactics={cov['tactics_covered']}/{cov['tactics_total']} "
+                f"({cov['tactic_coverage_percent']}%) techniques={cov['unique_techniques']} "
+                f"missing_tactics={', '.join(cov['tactics_with_zero_rules']) or 'none'}"
+            )
+
+        if output:
+            output.write_text(render_markdown(report), encoding="utf-8")
+            click.secho(f"Markdown report written to {output}", fg="green", err=True)
+
+    if strict and report["summary"]["findings_total"] > 0:
+        ctx.exit(1)
+    return report
+
+
+@root.command("detect-duplicates")
+@_analysis_options
+@click.pass_context
+def detect_duplicates_cmd(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    paths: tuple[Path, ...],
+    rules_dir: tuple[Path, ...],
+    output_format: str,
+    as_json: bool,
+    output: Path | None,
+    strict: bool,
+    include_deprecated: bool,
+    with_baseline: bool,
+) -> dict[str, Any]:
+    """Detect and classify duplicate/conflicting rules (去重与冲突检测)."""
+    target_paths = _resolve_analysis_paths(paths, rules_dir, with_baseline)
+    report = build_rule_analysis(target_paths, include_coverage=False, include_deprecated=include_deprecated)
+
+    if _wants_json(output_format, as_json, output):
+        payload = {
+            "summary": report["summary"],
+            "rules": report["rules"],
+            "findings": report["findings"],
+        }
+        _write_or_echo(report_to_json(payload), output)
+    elif output_format == "markdown":
+        _write_or_echo(render_markdown(report), output)
+    else:
+        summary = report["summary"]
+        click.secho("Duplicate & conflict detection", fg="cyan", bold=True)
+        click.echo(
+            f"analyzed={summary['rules_analyzed']} detected={summary['detected_rule_count']} "
+            f"duplicate_findings={summary['duplicate_findings']} "
+            f"conflict_findings={summary['conflict_findings']}"
+        )
+        rows = finding_rows(report)
+        if rows:
+            _echo_table(rows, ["id", "kind", "category", "confidence", "rules", "paths"])
+        else:
+            click.secho("No duplicates or conflicts detected.", fg="green")
+        if output:
+            output.write_text(report_to_json(report), encoding="utf-8")
+            click.secho(f"JSON report written to {output}", fg="green", err=True)
+
+    if strict and report["summary"]["findings_total"] > 0:
+        ctx.exit(1)
+    return report
+
+
+@root.command("coverage-report")
+@_ANALYSIS_PATH_ARG
+@_ANALYSIS_DIR_OPT
+@_FORMAT_OPT
+@_JSON_OPT
+@_OUTPUT_OPT
+@_DEPRECATED_OPT
+def coverage_report_cmd(  # noqa: PLR0913, PLR0917
+    paths: tuple[Path, ...],
+    rules_dir: tuple[Path, ...],
+    output_format: str,
+    as_json: bool,
+    output: Path | None,
+    include_deprecated: bool,
+) -> dict[str, Any]:
+    """Generate a rule coverage report (覆盖度报告)."""
+    target_paths = _resolve_analysis_paths(paths, rules_dir)
+    records, errors = load_records(target_paths, include_deprecated=include_deprecated)
+    coverage = build_coverage_report(records)
+    payload = {"rules_analyzed": len(records), "unparsed_files": errors, "coverage": coverage}
+
+    if _wants_json(output_format, as_json, output):
+        _write_or_echo(report_to_json(payload), output)
+        return payload
+    if output_format == "markdown" or (output and output.suffix in {".md", ".markdown"}):
+        _write_or_echo(render_coverage_markdown(coverage), output)
+        return payload
+
+    click.secho("Rule coverage", fg="cyan", bold=True)
+    click.echo(
+        f"rules={len(records)} tactics={coverage['tactics_covered']}/{coverage['tactics_total']} "
+        f"({coverage['tactic_coverage_percent']}%) techniques={coverage['unique_techniques']}"
+    )
+    click.echo(f"missing tactics: {', '.join(coverage['tactics_with_zero_rules']) or 'none'}")
+    for title, key, limit in (
+        ("By type", "by_rule_type", None),
+        ("By language", "by_language", None),
+        ("By platform", "by_platform", 15),
+        ("Tactics", "tactics", None),
+        ("Top techniques", "top_techniques", 15),
+    ):
+        mapping = coverage.get(key, {})
+        if not mapping:
+            continue
+        items = list(mapping.items())
+        if limit:
+            items = items[:limit]
+        click.secho(f"\n{title}:", fg="cyan")
+        _echo_table([{"name": k, "count": v} for k, v in items], ["name", "count"])
+
+    if output:
+        output.write_text(render_coverage_markdown(coverage), encoding="utf-8")
+        click.secho(f"Markdown report written to {output}", fg="green", err=True)
+    return payload
+
+
+# Discoverable aliases for the same capabilities.
+for _alias, _cmd in (
+    ("rule-analysis", analyze_rules_cmd),
+    ("analyze", analyze_rules_cmd),
+    ("rule-health", analyze_rules_cmd),
+    ("dedup", detect_duplicates_cmd),
+    ("dedupe", detect_duplicates_cmd),
+    ("detect-duplicate-rules", detect_duplicates_cmd),
+    ("duplicates", detect_duplicates_cmd),
+    ("conflict-check", detect_duplicates_cmd),
+    ("coverage", coverage_report_cmd),
+    ("rule-coverage", coverage_report_cmd),
+):
+    root.add_command(_cmd, _alias)
 
 
 @root.command("build-threat-map-entry")
